@@ -1,4 +1,4 @@
-python-binance
+streamlit
+ccxt
 pandas
-numpy
-python-dotenv
+plotly
