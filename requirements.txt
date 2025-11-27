@@ -4,3 +4,4 @@ plotly
 feedparser
 pandas
 ccxt
+tvdatafeed
