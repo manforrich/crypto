@@ -1,87 +1,75 @@
 import streamlit as st
-from tvDatafeed import TvDatafeed, Interval
+import ccxt
 import pandas as pd
 import plotly.graph_objs as go
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="TradingView 策略回測", layout="wide")
-st.title("📈 TradingView 數據源 - 策略回測系統")
-st.markdown("使用 **TradingView** 數據進行回測，支援加密貨幣、股票與外匯。")
+st.set_page_config(page_title="策略回測 (天數版)", layout="wide")
+st.title("📊 策略回測系統：自訂回測天數")
 
 # --- 1. 側邊欄：數據來源 ---
-st.sidebar.header("1. TradingView 數據設定")
+st.sidebar.header("1. 數據設定")
+common_pairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BTC/USD', 'ETH/USD', 'DOGE/USDT', 'XRP/USDT']
+selected_symbol = st.sidebar.selectbox("交易對", common_pairs)
+custom_symbol = st.sidebar.text_input("自定義 (如 BNB/USDT)", "").upper()
+if custom_symbol: selected_symbol = custom_symbol
 
-# 交易所與商品選擇
-exchange = st.sidebar.selectbox("交易所 (Exchange)", ["BINANCE", "COINBASE", "KRAKEN", "NASDAQ", "TWSE"], index=0)
-symbol_input = st.sidebar.text_input("商品代號 (Symbol)", "BTCUSDT").upper()
-full_symbol = f"{exchange}:{symbol_input}"
-
-# 時間週期對應 (TradingView 格式)
-interval_map = {
-    "15m": Interval.in_15_minute,
-    "1h": Interval.in_1_hour,
-    "4h": Interval.in_4_hour,
-    "1d": Interval.in_daily,
-    "1w": Interval.in_weekly
-}
-timeframe_label = st.sidebar.selectbox("K線週期", list(interval_map.keys()), index=3)
-selected_interval = interval_map[timeframe_label]
-
-backtest_days = st.sidebar.slider("回測 K 棒數量 (Bars)", 100, 2000, 365)
-initial_capital = st.sidebar.number_input("初始本金 (USDT/USD)", value=10000)
+# --- 修改重點：將 K 棒數量改為天數 ---
+timeframe = st.sidebar.selectbox("K線週期", ["15m", "1h", "4h", "1d", "1w"], index=3)
+backtest_days = st.sidebar.slider("回測天數 (Days)", min_value=7, max_value=365, value=30)
+initial_capital = st.sidebar.number_input("初始本金 (USDT)", value=10000)
 
 st.sidebar.markdown("---")
 
-# --- 2. 策略設定 (維持不變) ---
-st.sidebar.subheader("🔵 策略 A")
+# --- 2. 策略設定 ---
+st.sidebar.subheader("🔵 策略 A 設定")
 ma_type_a = st.sidebar.selectbox("種類 A", ["SMA", "EMA"], key='type_a')
 short_a = st.sidebar.number_input("短週期 A", value=5, key='short_a')
 long_a = st.sidebar.number_input("長週期 A", value=20, key='long_a')
 
-st.sidebar.subheader("🟠 策略 B")
+st.sidebar.markdown("---")
+st.sidebar.subheader("🟠 策略 B 設定")
 ma_type_b = st.sidebar.selectbox("種類 B", ["SMA", "EMA"], key='type_b', index=0)
 short_b = st.sidebar.number_input("短週期 B", value=10, key='short_b')
 long_b = st.sidebar.number_input("長週期 B", value=60, key='long_b')
 
-# --- 核心函數：TradingView 抓取 ---
-@st.cache_data(ttl=600)
-def get_tv_data(symbol, exchange, interval, n_bars):
-    tv = TvDatafeed() # 使用訪客模式 (無需帳號密碼)
-    
-    try:
-        # 抓取數據
-        df = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
-        
-        if df is None or df.empty:
-            return None
-            
-        # 整理資料格式
-        df = df.reset_index()
-        # TvDatafeed 的欄位通常是 symbol 名稱開頭 (例如 BINANCE:BTCUSDT:close)
-        # 我們需要重新命名為標準格式
-        df.columns = [col.split(':')[-1] for col in df.columns] 
-        
-        # 確保有標準欄位
-        rename_map = {
-            'datetime': 'timestamp',
-            'date': 'timestamp', # 有時候是 date
-            'open': 'open',
-            'high': 'high',
-            'low': 'low',
-            'close': 'close',
-            'volume': 'volume'
-        }
-        df = df.rename(columns=rename_map)
-        
-        # 確保 timestamp 是 datetime 格式
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        
-        return df
-    except Exception as e:
-        st.error(f"TradingView 抓取失敗: {e}")
-        return None
+# --- 函數區 ---
 
-# --- 策略計算函數 (通用) ---
+# 輔助函數：將天數轉換為 K 棒數量
+def calculate_limit_from_days(timeframe, days):
+    # 定義每個週期包含多少分鐘
+    tf_minutes = {
+        "15m": 15,
+        "1h": 60,
+        "4h": 240,
+        "1d": 1440,
+        "1w": 10080
+    }
+    minutes_per_candle = tf_minutes.get(timeframe, 1440)
+    total_minutes = days * 24 * 60
+    
+    # 計算需要多少根 K 棒
+    required_limit = int(total_minutes / minutes_per_candle)
+    
+    # API 安全限制 (Binance 公開 API 通常上限為 1000)
+    max_api_limit = 1000
+    
+    if required_limit > max_api_limit:
+        return max_api_limit, True # 回傳 True 代表被截斷了
+    return required_limit, False
+
+@st.cache_data(ttl=600)
+def get_data(symbol, timeframe, limit):
+    exchanges = [('Binance', ccxt.binance()), ('Binance US', ccxt.binanceus()), ('Kraken', ccxt.kraken())]
+    for name, exchange in exchanges:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df, name
+        except: continue
+    return None, None
+
 def calculate_ma(series, window, ma_type):
     if ma_type == "EMA": return series.ewm(span=window, adjust=False).mean()
     return series.rolling(window).mean()
@@ -128,32 +116,46 @@ def run_strategy(df_input, short_w, long_w, ma_type, capital):
             sell_signals.append((time, price))
             pnl = (price - current_entry_price) / current_entry_price * 100
             trade_log.append({"買入時間": current_entry_time, "買入價格": current_entry_price, "賣出時間": time, "賣出價格": price, "單筆獲利 (%)": pnl})
+            
         equity.append(balance + (position * price))
         
     df['Equity'] = equity
     final_equity = equity[-1]
     roi = ((final_equity - capital) / capital) * 100
     mdd = calculate_mdd(pd.Series(equity))
-    return {"final_equity": final_equity, "roi": roi, "trades": trades, "mdd": mdd, "df": df, "buys": buy_signals, "sells": sell_signals, "trade_log": pd.DataFrame(trade_log)}
+    df_log = pd.DataFrame(trade_log)
+    
+    return {"final_equity": final_equity, "roi": roi, "trades": trades, "mdd": mdd, "df": df, "buys": buy_signals, "sells": sell_signals, "trade_log": df_log}
 
 # --- 主程式 ---
-st.write(f"正在從 TradingView 獲取 **{full_symbol}** 的數據...")
 
-raw_data = get_tv_data(symbol_input, exchange, selected_interval, backtest_days)
+# 1. 計算限制
+limit, is_capped = calculate_limit_from_days(timeframe, backtest_days)
 
-if raw_data is not None and not raw_data.empty:
-    st.success(f"✅ 成功載入 {len(raw_data)} 根 K 棒 (區間: {raw_data['timestamp'].iloc[0].date()} ~ {raw_data['timestamp'].iloc[-1].date()})")
+st.write(f"正在分析 **{selected_symbol}**...")
+if is_capped:
+    st.warning(f"⚠️ 注意：由於交易所 API 限制單次最多 1000 根，**{timeframe}** 週期無法讀取完整的 **{backtest_days}** 天。目前已自動載入最近的 **1000** 根 K 棒。")
+else:
+    st.info(f"✅ 已成功載入 **{backtest_days}** 天的 **{timeframe}** 數據 ({limit} 根 K 棒)。")
 
-    # 基準 Buy & Hold
+raw_data, source = get_data(selected_symbol, timeframe, limit)
+
+if raw_data is not None:
+    # 執行回測邏輯 (與之前相同)
     bh_equity = initial_capital * (raw_data['close'] / raw_data['close'].iloc[0])
     bh_roi = ((bh_equity.iloc[-1] - initial_capital) / initial_capital) * 100
     bh_mdd = calculate_mdd(bh_equity)
 
-    # 執行策略
     res_a = run_strategy(raw_data, short_a, long_a, ma_type_a, initial_capital)
     res_b = run_strategy(raw_data, short_b, long_b, ma_type_b, initial_capital)
     
+    # 顯示日期範圍
+    start_date = raw_data['timestamp'].iloc[0].strftime('%Y-%m-%d')
+    end_date = raw_data['timestamp'].iloc[-1].strftime('%Y-%m-%d')
+    st.caption(f"📅 實際回測區間：{start_date} 至 {end_date} (數據來源: {source})")
+
     # --- 績效看板 ---
+    st.subheader("🏆 策略績效總覽")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.info(f"🔵 策略 A")
@@ -168,9 +170,10 @@ if raw_data is not None and not raw_data.empty:
         st.metric("ROI", f"{bh_roi:.2f}%")
         st.metric("MDD", f"{bh_mdd:.2f}%")
 
-    # --- 圖表與詳細分析 ---
+    # --- 詳細分析 ---
     st.markdown("---")
-    view_option = st.radio("選擇策略視角：", ("策略 A", "策略 B"), horizontal=True)
+    st.subheader("🔎 詳細進出場分析")
+    view_option = st.radio("選擇要查看的策略詳情：", ("策略 A", "策略 B"), horizontal=True)
     target_res = res_a if view_option == "策略 A" else res_b
     target_short = short_a if view_option == "策略 A" else short_b
     target_long = long_a if view_option == "策略 A" else long_b
@@ -197,5 +200,6 @@ if raw_data is not None and not raw_data.empty:
             st.dataframe(styled_df, use_container_width=True)
         else:
             st.warning("無交易紀錄")
+
 else:
-    st.error("無法從 TradingView 獲取數據。請檢查：\n1. 交易所名稱 (Exchange) 是否正確 (如 BINANCE, COINBASE)。\n2. 代號 (Symbol) 是否存在 (如 BTCUSDT)。")
+    st.error("無法取得數據，請稍後再試。")
