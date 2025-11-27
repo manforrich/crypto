@@ -1,8 +1,8 @@
 streamlit
 pandas
 plotly
-tvdatafeed
-ccxt
-yfinance
-lxml
 requests
+lxml
+websocket-client
+--upgrade pip
+tvdatafeed
