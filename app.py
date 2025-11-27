@@ -4,11 +4,10 @@ import pandas as pd
 import plotly.graph_objs as go
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="策略 vs Buy & Hold (含 MDD)", layout="wide")
-st.title("⚖️ 策略績效 vs Buy & Hold (含風險評估)")
-st.markdown("比較「均線策略」與「買入持有」的報酬率 (ROI) 與 最大回撤 (MDD)。")
+st.set_page_config(page_title="策略回測 + 交易明細", layout="wide")
+st.title("📊 策略回測系統：含詳細進出場點位")
 
-# --- 1. 側邊欄：數據設定 ---
+# --- 1. 側邊欄：數據來源 ---
 st.sidebar.header("1. 數據設定")
 common_pairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BTC/USD', 'ETH/USD', 'DOGE/USDT', 'XRP/USDT']
 selected_symbol = st.sidebar.selectbox("交易對", common_pairs)
@@ -50,15 +49,10 @@ def calculate_ma(series, window, ma_type):
     if ma_type == "EMA": return series.ewm(span=window, adjust=False).mean()
     return series.rolling(window).mean()
 
-# 計算回撤的輔助函數
 def calculate_mdd(equity_series):
-    # 1. 計算累積最大資產 (High Water Mark)
     running_max = equity_series.cummax()
-    # 2. 計算當前資產與最高點的落差比例
     drawdown = (equity_series - running_max) / running_max
-    # 3. 取最小的值 (因為是負數，越小代表跌越多)
-    mdd = drawdown.min() * 100 
-    return mdd
+    return drawdown.min() * 100 
 
 def run_strategy(df_input, short_w, long_w, ma_type, capital):
     df = df_input.copy()
@@ -66,6 +60,7 @@ def run_strategy(df_input, short_w, long_w, ma_type, capital):
     df[col_s] = calculate_ma(df['close'], short_w, ma_type)
     df[col_l] = calculate_ma(df['close'], long_w, ma_type)
     
+    # 產生訊號
     df['Signal'] = 0
     df.loc[(df[col_s] > df[col_l]) & (df[col_s].shift(1) <= df[col_l].shift(1)), 'Signal'] = 1
     df.loc[(df[col_s] < df[col_l]) & (df[col_s].shift(1) >= df[col_l].shift(1)), 'Signal'] = -1
@@ -75,93 +70,151 @@ def run_strategy(df_input, short_w, long_w, ma_type, capital):
     equity = []
     trades = 0
     
+    # 紀錄詳細交易清單 (Trade Log)
+    trade_log = [] 
+    current_entry_price = 0
+    current_entry_time = None
+
+    # 紀錄繪圖用的標記
+    buy_signals = []
+    sell_signals = []
+    
     for i, row in df.iterrows():
         price = row['close']
+        time = row['timestamp']
+        
+        # 買入邏輯
         if row['Signal'] == 1 and position == 0:
             position = balance / price
             balance = 0
             trades += 1
+            current_entry_price = price
+            current_entry_time = time
+            buy_signals.append((time, price))
+            
+        # 賣出邏輯
         elif row['Signal'] == -1 and position > 0:
             balance = position * price
             position = 0
             trades += 1
+            sell_signals.append((time, price))
+            
+            # 紀錄這筆完整交易
+            pnl = (price - current_entry_price) / current_entry_price * 100
+            trade_log.append({
+                "買入時間": current_entry_time,
+                "買入價格": current_entry_price,
+                "賣出時間": time,
+                "賣出價格": price,
+                "單筆獲利 (%)": pnl
+            })
+            
         equity.append(balance + (position * price))
         
     df['Equity'] = equity
     final_equity = equity[-1]
     roi = ((final_equity - capital) / capital) * 100
-    
-    # 計算 MDD
     mdd = calculate_mdd(pd.Series(equity))
     
-    return final_equity, roi, trades, df['Equity'], mdd
+    # 將交易紀錄轉為 DataFrame
+    df_log = pd.DataFrame(trade_log)
+    
+    return {
+        "final_equity": final_equity,
+        "roi": roi,
+        "trades": trades,
+        "mdd": mdd,
+        "df": df,
+        "buys": buy_signals,
+        "sells": sell_signals,
+        "trade_log": df_log
+    }
 
 # --- 主程式 ---
 st.write(f"正在分析 **{selected_symbol}**...")
 raw_data, source = get_data(selected_symbol, timeframe, limit)
 
 if raw_data is not None:
-    # 1. 計算 Buy and Hold 數據
-    start_price = raw_data['close'].iloc[0]
-    # B&H 的資產曲線就是價格走勢的映射
-    bh_equity_curve = initial_capital * (raw_data['close'] / start_price)
-    bh_final_equity = bh_equity_curve.iloc[-1]
-    bh_roi = ((bh_final_equity - initial_capital) / initial_capital) * 100
-    bh_mdd = calculate_mdd(bh_equity_curve)
+    # 1. 基準 Buy & Hold
+    bh_equity = initial_capital * (raw_data['close'] / raw_data['close'].iloc[0])
+    bh_roi = ((bh_equity.iloc[-1] - initial_capital) / initial_capital) * 100
+    bh_mdd = calculate_mdd(bh_equity)
 
-    # 2. 執行策略 A & B
-    eq_a, roi_a, trades_a, curve_a, mdd_a = run_strategy(raw_data, short_a, long_a, ma_type_a, initial_capital)
-    eq_b, roi_b, trades_b, curve_b, mdd_b = run_strategy(raw_data, short_b, long_b, ma_type_b, initial_capital)
+    # 2. 執行策略
+    res_a = run_strategy(raw_data, short_a, long_a, ma_type_a, initial_capital)
+    res_b = run_strategy(raw_data, short_b, long_b, ma_type_b, initial_capital)
     
-    # --- 顯示績效 ---
-    st.subheader("🏆 績效與風險分析")
-    
+    # --- 上方：績效總覽 ---
+    st.subheader("🏆 策略績效總覽")
     col1, col2, col3 = st.columns(3)
-    
-    # 顯示顏色設定 (MDD 越小(負越多)越危險，用紅色表示)
-    
     with col1:
-        st.info(f"🔵 **策略 A**")
-        st.metric("ROI (報酬率)", f"{roi_a:.2f}%", delta=f"{roi_a - bh_roi:.2f}% vs B&H")
-        st.metric("MDD (最大回撤)", f"{mdd_a:.2f}%", delta=f"{mdd_a - bh_mdd:.2f}% vs B&H", delta_color="inverse")
-        st.write(f"交易次數: {trades_a}")
-        
+        st.info(f"🔵 策略 A")
+        st.metric("ROI", f"{res_a['roi']:.2f}%", f"{res_a['roi']-bh_roi:.2f}% vs B&H")
+        st.metric("MDD", f"{res_a['mdd']:.2f}%", delta_color="inverse")
     with col2:
-        st.info(f"🟠 **策略 B**")
-        st.metric("ROI (報酬率)", f"{roi_b:.2f}%", delta=f"{roi_b - bh_roi:.2f}% vs B&H")
-        st.metric("MDD (最大回撤)", f"{mdd_b:.2f}%", delta=f"{mdd_b - bh_mdd:.2f}% vs B&H", delta_color="inverse")
-        st.write(f"交易次數: {trades_b}")
-
+        st.info(f"🟠 策略 B")
+        st.metric("ROI", f"{res_b['roi']:.2f}%", f"{res_b['roi']-bh_roi:.2f}% vs B&H")
+        st.metric("MDD", f"{res_b['mdd']:.2f}%", delta_color="inverse")
     with col3:
-        st.markdown("### 🏳️ **Buy & Hold (基準)**")
-        st.metric("ROI (報酬率)", f"{bh_roi:.2f}%")
-        st.metric("MDD (最大回撤)", f"{bh_mdd:.2f}%", help="如果一直持有不動，資產最多曾縮水多少")
-        
-        # 簡單評語
-        mdd_winner = "策略 A" if mdd_a > mdd_b else "策略 B" # MDD 數字比較大(接近0)比較好
-        st.caption(f"🛡️ 風險控制王者: {mdd_winner}")
+        st.write("### 🏳️ Buy & Hold")
+        st.metric("ROI", f"{bh_roi:.2f}%")
+        st.metric("MDD", f"{bh_mdd:.2f}%")
 
-    # --- 資產曲線圖 ---
-    st.subheader("📈 資產成長曲線")
-    fig_eq = go.Figure()
+    # --- 下方：詳細分析 (Tabs + Radio) ---
+    st.markdown("---")
+    st.subheader("🔎 詳細進出場分析")
     
-    fig_eq.add_trace(go.Scatter(x=raw_data['timestamp'], y=curve_a, mode='lines', name=f'策略 A', line=dict(color='#00BFFF', width=2)))
-    fig_eq.add_trace(go.Scatter(x=raw_data['timestamp'], y=curve_b, mode='lines', name=f'策略 B', line=dict(color='#FFA500', width=2)))
-    fig_eq.add_trace(go.Scatter(x=raw_data['timestamp'], y=bh_equity_curve, mode='lines', name='Buy & Hold', line=dict(color='gray', width=2, dash='dash')))
+    # 切換要看的策略
+    view_option = st.radio("選擇要查看的策略詳情：", ("策略 A", "策略 B"), horizontal=True)
     
-    fig_eq.add_hline(y=initial_capital, line_color="white", line_width=1, annotation_text="本金")
-    fig_eq.update_layout(template='plotly_dark', height=500, title="策略 vs B&H 資產走勢")
-    st.plotly_chart(fig_eq, use_container_width=True)
+    # 根據選擇載入資料
+    target_res = res_a if view_option == "策略 A" else res_b
+    target_short = short_a if view_option == "策略 A" else short_b
+    target_long = long_a if view_option == "策略 A" else long_b
+    target_df = target_res['df']
+    target_log = target_res['trade_log']
+    
+    tab1, tab2 = st.tabs(["📈 K 線圖與買賣點", "📋 交易明細表 (Trade Log)"])
 
-    # --- 詳細數據 ---
-    with st.expander("查看數據表格"):
-        st.dataframe(pd.DataFrame({
-            "日期": raw_data['timestamp'],
-            "價格": raw_data['close'],
-            "策略A資產": curve_a,
-            "策略B資產": curve_b,
-            "B&H資產": bh_equity_curve
-        }).sort_values("日期", ascending=False))
+    with tab1:
+        fig_k = go.Figure()
+        # K線
+        fig_k.add_trace(go.Candlestick(x=target_df['timestamp'], open=target_df['open'], high=target_df['high'], low=target_df['low'], close=target_df['close'], name='價格'))
+        # 均線
+        fig_k.add_trace(go.Scatter(x=target_df['timestamp'], y=target_df[f'MA_{target_short}'], line=dict(color='orange', width=1), name=f'MA {target_short}'))
+        fig_k.add_trace(go.Scatter(x=target_df['timestamp'], y=target_df[f'MA_{target_long}'], line=dict(color='blue', width=1), name=f'MA {target_long}'))
+        # 買賣點
+        if target_res['buys']:
+            bx, by = zip(*target_res['buys'])
+            fig_k.add_trace(go.Scatter(x=bx, y=by, mode='markers', name='買進 (Entry)', marker=dict(symbol='triangle-up', size=15, color='#00CC96')))
+        if target_res['sells']:
+            sx, sy = zip(*target_res['sells'])
+            fig_k.add_trace(go.Scatter(x=sx, y=sy, mode='markers', name='賣出 (Exit)', marker=dict(symbol='triangle-down', size=15, color='#EF553B')))
+            
+        fig_k.update_layout(template='plotly_dark', height=600, title=f"{view_option} 進出場點位可視化", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig_k, use_container_width=True)
+
+    with tab2:
+        if not target_log.empty:
+            # 格式化表格
+            st.markdown(f"### {view_option} 歷史交易紀錄")
+            
+            # 美化 DataFrame 顯示
+            styled_df = target_log.style.format({
+                "買入價格": "${:.2f}",
+                "賣出價格": "${:.2f}",
+                "單筆獲利 (%)": "{:.2f}%"
+            }).applymap(
+                lambda v: 'color: green' if v > 0 else 'color: red', subset=['單筆獲利 (%)']
+            )
+            
+            st.dataframe(styled_df, use_container_width=True)
+            
+            # 顯示簡單統計
+            win_rate = (target_log['單筆獲利 (%)'] > 0).mean() * 100
+            st.info(f"📊 交易統計：共交易 {len(target_log)} 筆 | 勝率: {win_rate:.1f}% | 平均單筆獲利: {target_log['單筆獲利 (%)'].mean():.2f}%")
+        else:
+            st.warning("在此回測期間內，該策略沒有產生任何完整的買賣交易。")
 
 else:
     st.error("無法取得數據，請稍後再試。")
