@@ -6,11 +6,12 @@ import time
 from datetime import datetime, timedelta
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="Binance 自訂日期回測", layout="wide")
-st.title("📅 自訂日期範圍回測系統")
+st.set_page_config(page_title="Binance 自訂日期回測 (抗封鎖版)", layout="wide")
+st.title("📅 自訂日期範圍回測系統 (抗封鎖修復版)")
 
 # --- 1. 側邊欄設定 ---
 st.sidebar.header("1. 數據設定")
+# 為了增加相容性 (Kraken/BinanceUS 常使用 USD)，建議同時提供 USDT 和 USD
 common_pairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BTC/USD', 'ETH/USD', 'DOGE/USDT', 'XRP/USDT']
 selected_symbol = st.sidebar.selectbox("交易對", common_pairs)
 custom_symbol = st.sidebar.text_input("自定義 (如 BNB/USDT)", "").upper()
@@ -18,12 +19,9 @@ if custom_symbol: selected_symbol = custom_symbol
 
 timeframe = st.sidebar.selectbox("K線週期", ["15m", "1h", "4h", "1d", "1w"], index=3)
 
-# --- 修改重點：日期選擇器 ---
 st.sidebar.markdown("### 選擇日期範圍")
-# 預設為過去 365 天
 default_start = datetime.now() - timedelta(days=365)
 default_end = datetime.now()
-
 col_d1, col_d2 = st.sidebar.columns(2)
 start_date = col_d1.date_input("開始日期", default_start)
 end_date = col_d2.date_input("結束日期", default_end)
@@ -31,7 +29,7 @@ end_date = col_d2.date_input("結束日期", default_end)
 initial_capital = st.sidebar.number_input("初始本金 (USDT)", value=10000)
 
 st.sidebar.markdown("---")
-# --- 策略設定 (保持不變) ---
+# --- 策略設定 ---
 st.sidebar.subheader("🔵 策略 A")
 ma_type_a = st.sidebar.selectbox("種類 A", ["SMA", "EMA"], key='type_a')
 short_a = st.sidebar.number_input("短 A", value=5, key='short_a')
@@ -42,78 +40,89 @@ ma_type_b = st.sidebar.selectbox("種類 B", ["SMA", "EMA"], key='type_b', index
 short_b = st.sidebar.number_input("短 B", value=10, key='short_b')
 long_b = st.sidebar.number_input("長 B", value=60, key='long_b')
 
-# --- 核心函數：分批抓取數據 ---
-@st.cache_data(ttl=3600) # 資料量大，快取設久一點 (1小時)
+# --- 核心函數：分批抓取數據 (含抗封鎖重試機制) ---
+@st.cache_data(ttl=3600)
 def get_data_by_date_range(symbol, timeframe, start_date, end_date):
-    # 初始化交易所 (使用 ccxt)
-    exchange = ccxt.binance()
-    
-    # 將日期轉換為 timestamp (毫秒)
-    since = exchange.parse8601(f"{start_date}T00:00:00Z")
-    end_timestamp = exchange.parse8601(f"{end_date}T23:59:59Z")
-    
-    all_ohlcv = []
-    limit = 1000 # Binance 單次上限
-    
-    # 進度條
+    # 定義要嘗試的交易所清單
+    # Binance Global -> Binance US (美國IP可用) -> Kraken (美國IP可用)
+    exchanges_list = [
+        ('Binance', ccxt.binance()), 
+        ('Binance US', ccxt.binanceus()), 
+        ('Kraken', ccxt.kraken())
+    ]
+
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    try:
-        while since < end_timestamp:
-            status_text.text(f"正在下載數據... 目前進度: {pd.to_datetime(since, unit='ms')}")
+    # 迴圈嘗試不同的交易所
+    for exchange_name, exchange in exchanges_list:
+        try:
+            # 測試連線與商品是否存在
+            # 先試抓 1 根，確認沒問題再開始大量下載
+            test_ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=1)
+            if not test_ohlcv:
+                # 可能是商品名稱不對 (例如 Kraken 用 BTC/USD 不用 USDT)
+                continue 
             
-            # 抓取數據
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            # --- 開始正式下載邏輯 ---
+            status_text.text(f"正在從 {exchange_name} 下載數據...")
             
-            if not ohlcv:
-                break
+            since = exchange.parse8601(f"{start_date}T00:00:00Z")
+            end_timestamp = exchange.parse8601(f"{end_date}T23:59:59Z")
+            all_ohlcv = []
+            limit = 1000 # 單次請求上限
             
-            # 將這一批數據加入總表
-            all_ohlcv += ohlcv
-            
-            # 更新下一次抓取的起始時間 (最後一筆數據的時間 + 1個時間單位的毫秒數，避免重複)
-            # 簡單做法：直接取最後一筆的時間
-            last_timestamp = ohlcv[-1][0]
-            
-            # 如果抓到的最新數據已經超過結束時間，就停止
-            if last_timestamp >= end_timestamp:
-                break
+            while since < end_timestamp:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+                if not ohlcv:
+                    break
                 
-            # 更新 since，準備抓下一頁
-            # 注意：必須比最後一筆大，否則會無窮迴圈。通常加 1ms 即可，exchange 會自動找下一根
-            since = last_timestamp + 1 
+                all_ohlcv += ohlcv
+                last_timestamp = ohlcv[-1][0]
+                
+                if last_timestamp >= end_timestamp:
+                    break
+                
+                since = last_timestamp + 1 
+                
+                # 計算進度
+                total_duration = end_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
+                current_duration = last_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
+                progress_val = min(current_duration / total_duration, 1.0)
+                progress_bar.progress(progress_val)
+                
+                # 稍微休息避免被交易所擋
+                time.sleep(exchange.rateLimit / 1000 if exchange.rateLimit else 0.1)
+
+            # 下載完成後的處理
+            if not all_ohlcv:
+                continue # 換下一家
+
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             
-            # 稍微暫停避免觸發 API Rate Limit (雖然 Binance 公開 API 限制很寬鬆)
-            time.sleep(0.1)
+            # 過濾日期範圍
+            mask = (df['timestamp'] >= pd.to_datetime(start_date)) & (df['timestamp'] <= pd.to_datetime(end_date) + timedelta(days=1))
+            df = df.loc[mask]
             
-            # 簡單計算進度 (視覺用)
-            current_progress = min((since - exchange.parse8601(f"{start_date}T00:00:00Z")) / (end_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")), 1.0)
-            progress_bar.progress(current_progress)
+            # 成功回傳！
+            progress_bar.progress(1.0)
+            status_text.empty()
+            return df, exchange_name
+            
+        except ccxt.BadSymbol:
+            # 找不到該幣種，換下一家
+            continue
+        except Exception as e:
+            # 遇到 451 或其他網路錯誤，換下一家
+            print(f"{exchange_name} Error: {e}")
+            continue
 
-        progress_bar.progress(1.0)
-        status_text.text("下載完成！")
-        time.sleep(0.5)
-        status_text.empty()
-        progress_bar.empty()
-        
-        if not all_ohlcv:
-            return None, "No Data"
+    # 如果全部都失敗
+    progress_bar.empty()
+    return None, "All Exchanges Failed"
 
-        # 整理 DataFrame
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # 過濾掉超出範圍的數據 (因為最後一次抓取可能會多抓一點點)
-        mask = (df['timestamp'] >= pd.to_datetime(start_date)) & (df['timestamp'] <= pd.to_datetime(end_date) + timedelta(days=1))
-        df = df.loc[mask]
-        
-        return df, "Binance"
-        
-    except Exception as e:
-        return None, str(e)
-
-# --- 策略計算函數 (通用) ---
+# --- 策略計算函數 ---
 def calculate_ma(series, window, ma_type):
     if ma_type == "EMA": return series.ewm(span=window, adjust=False).mean()
     return series.rolling(window).mean()
@@ -170,17 +179,16 @@ def run_strategy(df_input, short_w, long_w, ma_type, capital):
 
 # --- 主程式執行 ---
 
-# 檢查日期順序
 if start_date > end_date:
     st.error("❌ 開始日期必須早於結束日期！")
 else:
-    st.write(f"正在從 Binance 下載 **{selected_symbol}** ({timeframe}) 數據...")
-    st.caption(f"區間：{start_date} 至 {end_date}")
+    st.write(f"正在搜尋 **{selected_symbol}** 的數據 (自動切換節點)...")
+    st.caption(f"目標區間：{start_date} 至 {end_date}")
     
     raw_data, source = get_data_by_date_range(selected_symbol, timeframe, start_date, end_date)
 
     if raw_data is not None and not raw_data.empty:
-        st.success(f"✅ 下載完成！共 {len(raw_data)} 根 K 棒。")
+        st.success(f"✅ 成功從 **{source}** 下載數據！共 {len(raw_data)} 根 K 棒。")
         
         # 1. 基準 Buy & Hold
         bh_equity = initial_capital * (raw_data['close'] / raw_data['close'].iloc[0])
@@ -239,4 +247,4 @@ else:
                 st.warning("無交易紀錄")
 
     else:
-        st.error(f"無法獲取數據 (Error: {source})。可能原因：\n1. 該交易對在選定的日期範圍內沒有數據。\n2. 網路連線問題。")
+        st.error(f"❌ 無法獲取數據。所有交易所 (Binance, Binance US, Kraken) 皆嘗試失敗。\n請檢查：\n1. 交易對名稱 (如 BTC/USDT 在 Kraken 上可能是 BTC/USD)。\n2. 該交易對是否過於冷門。")
