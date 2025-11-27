@@ -10,7 +10,7 @@ st.title("🔶 Binance 加密貨幣即時儀表板")
 
 # --- 初始化 Binance ---
 # 使用 ccxt 連接 Binance 公開 API (不需要 API Key 即可獲取價格)
-exchange = ccxt.binanceus()
+exchange = ccxt.karken()
 
 # --- 側邊欄設定 ---
 st.sidebar.header("設定選項")
