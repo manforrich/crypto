@@ -3,12 +3,13 @@ import ccxt
 import pandas as pd
 import numpy as np
 import plotly.graph_objs as go
+from plotly.subplots import make_subplots # 引入子圖功能
 import time
 from datetime import datetime, timedelta
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="HMA/EMA/SMA 全能回測", layout="wide")
-st.title("🚀 HMA / EMA / SMA 全能策略回測系統")
+st.set_page_config(page_title="全能回測 (含成交量)", layout="wide")
+st.title("🚀 全能策略回測系統 (含量價分析)")
 
 # --- 1. 側邊欄設定 ---
 st.sidebar.header("1. 數據設定")
@@ -30,18 +31,23 @@ initial_capital = st.sidebar.number_input("初始本金 (USDT)", value=10000)
 
 st.sidebar.markdown("---")
 
-# --- 2. 策略設定 (新增 HMA 選項) ---
+# --- 2. 策略設定 ---
 ma_options = ["SMA (簡單)", "EMA (指數)", "HMA (赫爾)"]
 
 st.sidebar.subheader("🔵 策略 A")
-ma_type_a = st.sidebar.selectbox("種類 A", ma_options, key='type_a', index=1) # 預設 EMA
+ma_type_a = st.sidebar.selectbox("種類 A", ma_options, key='type_a', index=1)
 short_a = st.sidebar.number_input("短 A", value=5, key='short_a')
 long_a = st.sidebar.number_input("長 A", value=20, key='long_a')
 
 st.sidebar.subheader("🟠 策略 B")
-ma_type_b = st.sidebar.selectbox("種類 B", ma_options, key='type_b', index=2) # 預設 HMA
+ma_type_b = st.sidebar.selectbox("種類 B", ma_options, key='type_b', index=2)
 short_b = st.sidebar.number_input("短 B", value=10, key='short_b')
 long_b = st.sidebar.number_input("長 B", value=60, key='long_b')
+
+st.sidebar.markdown("---")
+# --- 新增：成交量設定 ---
+st.sidebar.subheader("📊 成交量設定")
+vol_ma_len = st.sidebar.number_input("成交量均線週期 (Vol MA)", value=20)
 
 # --- 核心函數：分批抓取數據 (抗封鎖版) ---
 @st.cache_data(ttl=3600)
@@ -52,9 +58,7 @@ def get_data_by_date_range(symbol, timeframe, start_date, end_date):
     
     for exchange_name, exchange in exchanges_list:
         try:
-            # 測試連線
             if not exchange.fetch_ohlcv(symbol, timeframe, limit=1): continue 
-            
             status_text.text(f"正在從 {exchange_name} 下載數據...")
             since = exchange.parse8601(f"{start_date}T00:00:00Z")
             end_timestamp = exchange.parse8601(f"{end_date}T23:59:59Z")
@@ -68,74 +72,60 @@ def get_data_by_date_range(symbol, timeframe, start_date, end_date):
                 last_timestamp = ohlcv[-1][0]
                 if last_timestamp >= end_timestamp: break
                 since = last_timestamp + 1 
-                
-                # 計算進度
                 total = end_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
                 curr = last_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
                 progress_bar.progress(min(curr / total, 1.0))
                 time.sleep(exchange.rateLimit / 1000 if exchange.rateLimit else 0.1)
 
             if not all_ohlcv: continue
-
             df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             mask = (df['timestamp'] >= pd.to_datetime(start_date)) & (df['timestamp'] <= pd.to_datetime(end_date) + timedelta(days=1))
             df = df.loc[mask]
-            
             progress_bar.progress(1.0)
             status_text.empty()
             return df, exchange_name
-            
         except: continue
-
     progress_bar.empty()
     return None, "Fail"
 
-# --- 數學指標計算函數 (含 HMA) ---
-
-# 1. 計算 WMA (加權移動平均) - HMA 的基礎
+# --- 數學指標計算函數 ---
 def calculate_wma(series, window):
     weights = np.arange(1, window + 1)
-    # 使用 rolling().apply 進行加權運算
     return series.rolling(window).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
 
-# 2. 計算 HMA (赫爾移動平均)
 def calculate_hma(series, window):
     half_window = int(window / 2)
     sqrt_window = int(np.sqrt(window))
-    
     wma_half = calculate_wma(series, half_window)
     wma_full = calculate_wma(series, window)
-    
     raw_hma = 2 * wma_half - wma_full
     return calculate_wma(raw_hma, sqrt_window)
 
-# 3. 綜合計算入口
 def calculate_ma(series, window, ma_type):
-    if "EMA" in ma_type:
-        return series.ewm(span=window, adjust=False).mean()
-    elif "HMA" in ma_type:
-        return calculate_hma(series, window)
-    else: # SMA
-        return series.rolling(window).mean()
+    if "EMA" in ma_type: return series.ewm(span=window, adjust=False).mean()
+    elif "HMA" in ma_type: return calculate_hma(series, window)
+    else: return series.rolling(window).mean()
 
 def calculate_mdd(equity_series):
     running_max = equity_series.cummax()
     drawdown = (equity_series - running_max) / running_max
     return drawdown.min() * 100 
 
-def run_strategy(df_input, short_w, long_w, ma_type, capital):
+def run_strategy(df_input, short_w, long_w, ma_type, capital, vol_ma_len):
     df = df_input.copy()
     col_s, col_l = f'MA_{short_w}', f'MA_{long_w}'
     
-    # 計算兩條均線
+    # 1. 計算價格均線
     df[col_s] = calculate_ma(df['close'], short_w, ma_type)
     df[col_l] = calculate_ma(df['close'], long_w, ma_type)
     
+    # 2. 計算成交量均線 (固定使用 SMA)
+    df['Vol_MA'] = df['volume'].rolling(window=vol_ma_len).mean()
+    
+    # 3. 策略訊號
     df['Signal'] = 0
-    # 黃金交叉: 短 > 長 且 前一根 短 <= 長
     df.loc[(df[col_s] > df[col_l]) & (df[col_s].shift(1) <= df[col_l].shift(1)), 'Signal'] = 1
-    # 死亡交叉: 短 < 長 且 前一根 短 >= 長
     df.loc[(df[col_s] < df[col_l]) & (df[col_s].shift(1) >= df[col_l].shift(1)), 'Signal'] = -1
     
     balance = capital
@@ -178,23 +168,22 @@ def run_strategy(df_input, short_w, long_w, ma_type, capital):
 if start_date > end_date:
     st.error("❌ 日期設定錯誤")
 else:
-    st.write(f"正在下載 **{selected_symbol}** 數據 (自動切換節點)...")
-    
+    st.write(f"正在下載 **{selected_symbol}** 數據...")
     raw_data, source = get_data_by_date_range(selected_symbol, timeframe, start_date, end_date)
 
     if raw_data is not None and not raw_data.empty:
         st.success(f"✅ 下載完成 (來源: {source}) | 共 {len(raw_data)} 根 K 棒")
         
-        # 1. 基準 Buy & Hold
+        # 基準
         bh_equity = initial_capital * (raw_data['close'] / raw_data['close'].iloc[0])
         bh_roi = ((bh_equity.iloc[-1] - initial_capital) / initial_capital) * 100
         bh_mdd = calculate_mdd(bh_equity)
 
-        # 2. 執行策略 (支援 SMA/EMA/HMA)
-        res_a = run_strategy(raw_data, short_a, long_a, ma_type_a, initial_capital)
-        res_b = run_strategy(raw_data, short_b, long_b, ma_type_b, initial_capital)
+        # 執行策略
+        res_a = run_strategy(raw_data, short_a, long_a, ma_type_a, initial_capital, vol_ma_len)
+        res_b = run_strategy(raw_data, short_b, long_b, ma_type_b, initial_capital, vol_ma_len)
         
-        # --- 績效看板 ---
+        # 看板
         st.subheader("🏆 策略績效總覽")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -210,32 +199,48 @@ else:
             st.metric("ROI", f"{bh_roi:.2f}%")
             st.metric("MDD", f"{bh_mdd:.2f}%")
 
-        # --- 詳細分析 ---
+        # --- 詳細分析 (含成交量圖) ---
         st.markdown("---")
-        st.subheader("🔎 詳細進出場分析")
+        st.subheader("🔎 詳細進出場與成交量分析")
         view_option = st.radio("選擇要查看的策略詳情：", ("策略 A", "策略 B"), horizontal=True)
         target_res = res_a if view_option == "策略 A" else res_b
         target_short = short_a if view_option == "策略 A" else short_b
         target_long = long_a if view_option == "策略 A" else long_b
         
-        tab1, tab2 = st.tabs(["📈 K 線圖與買賣點", "📋 交易明細表"])
+        tab1, tab2 = st.tabs(["📈 K 線與成交量圖", "📋 交易明細表"])
 
         with tab1:
-            fig_k = go.Figure()
-            # K線
-            fig_k.add_trace(go.Candlestick(x=target_res['df']['timestamp'], open=target_res['df']['open'], high=target_res['df']['high'], low=target_res['df']['low'], close=target_res['df']['close'], name='價格'))
-            # 均線
-            fig_k.add_trace(go.Scatter(x=target_res['df']['timestamp'], y=target_res['df'][f'MA_{target_short}'], line=dict(color='orange', width=1), name=f'MA {target_short}'))
-            fig_k.add_trace(go.Scatter(x=target_res['df']['timestamp'], y=target_res['df'][f'MA_{target_long}'], line=dict(color='blue', width=1), name=f'MA {target_long}'))
-            # 買賣點
+            df = target_res['df']
+            # 建立子圖 (2列 1行, 共享X軸, 上圖高下圖矮)
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                vertical_spacing=0.03, subplot_titles=(f'{selected_symbol} 價格走勢', '成交量'),
+                                row_heights=[0.7, 0.3])
+
+            # 1. 上圖：K線與價格均線
+            fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='價格'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df[f'MA_{target_short}'], line=dict(color='orange', width=1), name=f'MA {target_short}'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df[f'MA_{target_long}'], line=dict(color='blue', width=1), name=f'MA {target_long}'), row=1, col=1)
+            
+            # 買賣點標記
             if target_res['buys']:
                 bx, by = zip(*target_res['buys'])
-                fig_k.add_trace(go.Scatter(x=bx, y=by, mode='markers', name='買進', marker=dict(symbol='triangle-up', size=15, color='#00CC96')))
+                fig.add_trace(go.Scatter(x=bx, y=by, mode='markers', name='買進', marker=dict(symbol='triangle-up', size=15, color='#00CC96')), row=1, col=1)
             if target_res['sells']:
                 sx, sy = zip(*target_res['sells'])
-                fig_k.add_trace(go.Scatter(x=sx, y=sy, mode='markers', name='賣出', marker=dict(symbol='triangle-down', size=15, color='#EF553B')))
-            fig_k.update_layout(template='plotly_dark', height=600, xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig_k, use_container_width=True)
+                fig.add_trace(go.Scatter(x=sx, y=sy, mode='markers', name='賣出', marker=dict(symbol='triangle-down', size=15, color='#EF553B')), row=1, col=1)
+
+            # 2. 下圖：成交量與 Vol MA
+            # 設定顏色：收盤 >= 開盤 為綠色，否則為紅色
+            vol_colors = ['#00CC96' if c >= o else '#EF553B' for c, o in zip(df['close'], df['open'])]
+            
+            fig.add_trace(go.Bar(x=df['timestamp'], y=df['volume'], marker_color=vol_colors, name='成交量'), row=2, col=1)
+            
+            # 成交量均線 (白色線條)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Vol_MA'], line=dict(color='white', width=1.5), name=f'Vol MA {vol_ma_len}'), row=2, col=1)
+
+            # 移除下方的 Range Slider
+            fig.update_layout(template='plotly_dark', height=700, xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
 
         with tab2:
             if not target_res['trade_log'].empty:
@@ -244,4 +249,4 @@ else:
             else:
                 st.warning("無交易紀錄")
     else:
-        st.error("無法獲取數據，請檢查交易對或網路。")
+        st.error("無法獲取數據")
