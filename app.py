@@ -1,17 +1,17 @@
 import streamlit as st
 import ccxt
 import pandas as pd
+import numpy as np
 import plotly.graph_objs as go
 import time
 from datetime import datetime, timedelta
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="Binance 自訂日期回測 (抗封鎖版)", layout="wide")
-st.title("📅 自訂日期範圍回測系統 (抗封鎖修復版)")
+st.set_page_config(page_title="HMA/EMA/SMA 全能回測", layout="wide")
+st.title("🚀 HMA / EMA / SMA 全能策略回測系統")
 
 # --- 1. 側邊欄設定 ---
 st.sidebar.header("1. 數據設定")
-# 為了增加相容性 (Kraken/BinanceUS 常使用 USD)，建議同時提供 USDT 和 USD
 common_pairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BTC/USD', 'ETH/USD', 'DOGE/USDT', 'XRP/USDT']
 selected_symbol = st.sidebar.selectbox("交易對", common_pairs)
 custom_symbol = st.sidebar.text_input("自定義 (如 BNB/USDT)", "").upper()
@@ -29,103 +29,95 @@ end_date = col_d2.date_input("結束日期", default_end)
 initial_capital = st.sidebar.number_input("初始本金 (USDT)", value=10000)
 
 st.sidebar.markdown("---")
-# --- 策略設定 ---
+
+# --- 2. 策略設定 (新增 HMA 選項) ---
+ma_options = ["SMA (簡單)", "EMA (指數)", "HMA (赫爾)"]
+
 st.sidebar.subheader("🔵 策略 A")
-ma_type_a = st.sidebar.selectbox("種類 A", ["SMA", "EMA"], key='type_a')
+ma_type_a = st.sidebar.selectbox("種類 A", ma_options, key='type_a', index=1) # 預設 EMA
 short_a = st.sidebar.number_input("短 A", value=5, key='short_a')
 long_a = st.sidebar.number_input("長 A", value=20, key='long_a')
 
 st.sidebar.subheader("🟠 策略 B")
-ma_type_b = st.sidebar.selectbox("種類 B", ["SMA", "EMA"], key='type_b', index=0)
+ma_type_b = st.sidebar.selectbox("種類 B", ma_options, key='type_b', index=2) # 預設 HMA
 short_b = st.sidebar.number_input("短 B", value=10, key='short_b')
 long_b = st.sidebar.number_input("長 B", value=60, key='long_b')
 
-# --- 核心函數：分批抓取數據 (含抗封鎖重試機制) ---
+# --- 核心函數：分批抓取數據 (抗封鎖版) ---
 @st.cache_data(ttl=3600)
 def get_data_by_date_range(symbol, timeframe, start_date, end_date):
-    # 定義要嘗試的交易所清單
-    # Binance Global -> Binance US (美國IP可用) -> Kraken (美國IP可用)
-    exchanges_list = [
-        ('Binance', ccxt.binance()), 
-        ('Binance US', ccxt.binanceus()), 
-        ('Kraken', ccxt.kraken())
-    ]
-
+    exchanges_list = [('Binance', ccxt.binance()), ('Binance US', ccxt.binanceus()), ('Kraken', ccxt.kraken())]
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 迴圈嘗試不同的交易所
     for exchange_name, exchange in exchanges_list:
         try:
-            # 測試連線與商品是否存在
-            # 先試抓 1 根，確認沒問題再開始大量下載
-            test_ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=1)
-            if not test_ohlcv:
-                # 可能是商品名稱不對 (例如 Kraken 用 BTC/USD 不用 USDT)
-                continue 
+            # 測試連線
+            if not exchange.fetch_ohlcv(symbol, timeframe, limit=1): continue 
             
-            # --- 開始正式下載邏輯 ---
             status_text.text(f"正在從 {exchange_name} 下載數據...")
-            
             since = exchange.parse8601(f"{start_date}T00:00:00Z")
             end_timestamp = exchange.parse8601(f"{end_date}T23:59:59Z")
             all_ohlcv = []
-            limit = 1000 # 單次請求上限
+            limit = 1000 
             
             while since < end_timestamp:
                 ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-                if not ohlcv:
-                    break
-                
+                if not ohlcv: break
                 all_ohlcv += ohlcv
                 last_timestamp = ohlcv[-1][0]
-                
-                if last_timestamp >= end_timestamp:
-                    break
-                
+                if last_timestamp >= end_timestamp: break
                 since = last_timestamp + 1 
                 
                 # 計算進度
-                total_duration = end_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
-                current_duration = last_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
-                progress_val = min(current_duration / total_duration, 1.0)
-                progress_bar.progress(progress_val)
-                
-                # 稍微休息避免被交易所擋
+                total = end_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
+                curr = last_timestamp - exchange.parse8601(f"{start_date}T00:00:00Z")
+                progress_bar.progress(min(curr / total, 1.0))
                 time.sleep(exchange.rateLimit / 1000 if exchange.rateLimit else 0.1)
 
-            # 下載完成後的處理
-            if not all_ohlcv:
-                continue # 換下一家
+            if not all_ohlcv: continue
 
             df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            
-            # 過濾日期範圍
             mask = (df['timestamp'] >= pd.to_datetime(start_date)) & (df['timestamp'] <= pd.to_datetime(end_date) + timedelta(days=1))
             df = df.loc[mask]
             
-            # 成功回傳！
             progress_bar.progress(1.0)
             status_text.empty()
             return df, exchange_name
             
-        except ccxt.BadSymbol:
-            # 找不到該幣種，換下一家
-            continue
-        except Exception as e:
-            # 遇到 451 或其他網路錯誤，換下一家
-            print(f"{exchange_name} Error: {e}")
-            continue
+        except: continue
 
-    # 如果全部都失敗
     progress_bar.empty()
-    return None, "All Exchanges Failed"
+    return None, "Fail"
 
-# --- 策略計算函數 ---
+# --- 數學指標計算函數 (含 HMA) ---
+
+# 1. 計算 WMA (加權移動平均) - HMA 的基礎
+def calculate_wma(series, window):
+    weights = np.arange(1, window + 1)
+    # 使用 rolling().apply 進行加權運算
+    return series.rolling(window).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+# 2. 計算 HMA (赫爾移動平均)
+def calculate_hma(series, window):
+    half_window = int(window / 2)
+    sqrt_window = int(np.sqrt(window))
+    
+    wma_half = calculate_wma(series, half_window)
+    wma_full = calculate_wma(series, window)
+    
+    raw_hma = 2 * wma_half - wma_full
+    return calculate_wma(raw_hma, sqrt_window)
+
+# 3. 綜合計算入口
 def calculate_ma(series, window, ma_type):
-    if ma_type == "EMA": return series.ewm(span=window, adjust=False).mean()
-    return series.rolling(window).mean()
+    if "EMA" in ma_type:
+        return series.ewm(span=window, adjust=False).mean()
+    elif "HMA" in ma_type:
+        return calculate_hma(series, window)
+    else: # SMA
+        return series.rolling(window).mean()
 
 def calculate_mdd(equity_series):
     running_max = equity_series.cummax()
@@ -135,11 +127,15 @@ def calculate_mdd(equity_series):
 def run_strategy(df_input, short_w, long_w, ma_type, capital):
     df = df_input.copy()
     col_s, col_l = f'MA_{short_w}', f'MA_{long_w}'
+    
+    # 計算兩條均線
     df[col_s] = calculate_ma(df['close'], short_w, ma_type)
     df[col_l] = calculate_ma(df['close'], long_w, ma_type)
     
     df['Signal'] = 0
+    # 黃金交叉: 短 > 長 且 前一根 短 <= 長
     df.loc[(df[col_s] > df[col_l]) & (df[col_s].shift(1) <= df[col_l].shift(1)), 'Signal'] = 1
+    # 死亡交叉: 短 < 長 且 前一根 短 >= 長
     df.loc[(df[col_s] < df[col_l]) & (df[col_s].shift(1) >= df[col_l].shift(1)), 'Signal'] = -1
     
     balance = capital
@@ -180,22 +176,21 @@ def run_strategy(df_input, short_w, long_w, ma_type, capital):
 # --- 主程式執行 ---
 
 if start_date > end_date:
-    st.error("❌ 開始日期必須早於結束日期！")
+    st.error("❌ 日期設定錯誤")
 else:
-    st.write(f"正在搜尋 **{selected_symbol}** 的數據 (自動切換節點)...")
-    st.caption(f"目標區間：{start_date} 至 {end_date}")
+    st.write(f"正在下載 **{selected_symbol}** 數據 (自動切換節點)...")
     
     raw_data, source = get_data_by_date_range(selected_symbol, timeframe, start_date, end_date)
 
     if raw_data is not None and not raw_data.empty:
-        st.success(f"✅ 成功從 **{source}** 下載數據！共 {len(raw_data)} 根 K 棒。")
+        st.success(f"✅ 下載完成 (來源: {source}) | 共 {len(raw_data)} 根 K 棒")
         
         # 1. 基準 Buy & Hold
         bh_equity = initial_capital * (raw_data['close'] / raw_data['close'].iloc[0])
         bh_roi = ((bh_equity.iloc[-1] - initial_capital) / initial_capital) * 100
         bh_mdd = calculate_mdd(bh_equity)
 
-        # 2. 執行策略
+        # 2. 執行策略 (支援 SMA/EMA/HMA)
         res_a = run_strategy(raw_data, short_a, long_a, ma_type_a, initial_capital)
         res_b = run_strategy(raw_data, short_b, long_b, ma_type_b, initial_capital)
         
@@ -203,11 +198,11 @@ else:
         st.subheader("🏆 策略績效總覽")
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.info(f"🔵 策略 A")
+            st.info(f"🔵 策略 A: {ma_type_a} ({short_a}/{long_a})")
             st.metric("ROI", f"{res_a['roi']:.2f}%", f"{res_a['roi']-bh_roi:.2f}% vs B&H")
             st.metric("MDD", f"{res_a['mdd']:.2f}%", delta_color="inverse")
         with col2:
-            st.info(f"🟠 策略 B")
+            st.info(f"🟠 策略 B: {ma_type_b} ({short_b}/{long_b})")
             st.metric("ROI", f"{res_b['roi']:.2f}%", f"{res_b['roi']-bh_roi:.2f}% vs B&H")
             st.metric("MDD", f"{res_b['mdd']:.2f}%", delta_color="inverse")
         with col3:
@@ -227,9 +222,12 @@ else:
 
         with tab1:
             fig_k = go.Figure()
+            # K線
             fig_k.add_trace(go.Candlestick(x=target_res['df']['timestamp'], open=target_res['df']['open'], high=target_res['df']['high'], low=target_res['df']['low'], close=target_res['df']['close'], name='價格'))
+            # 均線
             fig_k.add_trace(go.Scatter(x=target_res['df']['timestamp'], y=target_res['df'][f'MA_{target_short}'], line=dict(color='orange', width=1), name=f'MA {target_short}'))
             fig_k.add_trace(go.Scatter(x=target_res['df']['timestamp'], y=target_res['df'][f'MA_{target_long}'], line=dict(color='blue', width=1), name=f'MA {target_long}'))
+            # 買賣點
             if target_res['buys']:
                 bx, by = zip(*target_res['buys'])
                 fig_k.add_trace(go.Scatter(x=bx, y=by, mode='markers', name='買進', marker=dict(symbol='triangle-up', size=15, color='#00CC96')))
@@ -245,6 +243,5 @@ else:
                 st.dataframe(styled_df, use_container_width=True)
             else:
                 st.warning("無交易紀錄")
-
     else:
-        st.error(f"❌ 無法獲取數據。所有交易所 (Binance, Binance US, Kraken) 皆嘗試失敗。\n請檢查：\n1. 交易對名稱 (如 BTC/USDT 在 Kraken 上可能是 BTC/USD)。\n2. 該交易對是否過於冷門。")
+        st.error("無法獲取數據，請檢查交易對或網路。")
