@@ -3,3 +3,4 @@ yfinance>=0.2.40
 plotly
 feedparser
 pandas
+ccxt
