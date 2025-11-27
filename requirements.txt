@@ -1,7 +1,8 @@
 streamlit
-yfinance>=0.2.40
-plotly
-feedparser
 pandas
-ccxt
+plotly
 tvdatafeed
+ccxt
+yfinance
+lxml
+requests
